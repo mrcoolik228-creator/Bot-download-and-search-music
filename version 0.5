@@ -1,0 +1,201 @@
+import logging
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
+)
+import lyricsgenius as genius
+import os
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# БЕЗОПАСНОСТЬ: Используйте переменные окружения или храните токены в отдельном файле
+# Токены ДОЛЖНЫ быть скрыты. Вот как получить их из переменных окружения:
+TOKEN = os.getenv('7771523443:AAE9A_BibaCFfQccpAWQLjMr_CtqDBcURYs', '7771523443:AAE9A_BibaCFfQccpAWQLjMr_CtqDBcURYs')  # Вставьте ваш токен сюда ТОЛЬКО для тестирования
+GENIUS_TOKEN = os.getenv('NWx2QGJB6a0PNS5PN1XjPBnf9FRSUWKtN4-pow2F7nvKNbv6H4RiI_B-UPMW0KZ9', 'NWx2QGJB6a0PNS5PN1XjPBnf9FRSUWKtN4-pow2F7nvKNbv6H4RiI_B-UPMW0KZ9')  # Вставьте ваш токен сюда ТОЛЬКО для тестирования
+
+# Инициализация Genius API
+try:
+    genius_api = genius.Genius(GENIUS_TOKEN)
+    genius_api.verbose = False  # Отключаем лишние сообщения в консоли
+except Exception as e:
+    logger.error(f"Ошибка инициализации Genius API: {e}")
+    genius_api = None
+
+# Определение состояний для ConversationHandler (опционально, но рекомендуется)
+WAITING_FOR_LYRICS = 1
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    keyboard = [
+        ["Найти музыку по тексту"],
+        ["Скачать музыку"]
+    ]
+    
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        "Добро пожаловать! Выберите действие:",
+        reply_markup=reply_markup
+    )
+    
+    # Сбрасываем любые предыдущие состояния
+    if 'state' in context.user_data:
+        context.user_data.pop('state')
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки клавиатуры"""
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    if text == "Найти музыку по тексту":
+        await update.message.reply_text(
+            "Пожалуйста, отправьте отрывок текста песни (несколько строк), и я попробую найти её."
+        )
+        # Сохраняем состояние в context.user_data (лучше чем глобальная переменная)
+        context.user_data['state'] = 'waiting_for_lyrics'
+        
+    elif text == "Скачать музыку":
+        await update.message.reply_text(
+            "Функция скачивания музыки в разработке. Пока вы можете найти песни по тексту."
+        )
+        
+    elif context.user_data.get('state') == 'waiting_for_lyrics':
+        # Пользователь прислал текст для поиска
+        lyrics_snippet = text.strip()
+        
+        if len(lyrics_snippet) < 5:
+            await update.message.reply_text("Пожалуйста, отправьте более длинный отрывок (минимум 5 символов).")
+            return
+            
+        await update.message.reply_text(f"Ищу песню по тексту: '{lyrics_snippet[:50]}...'")
+        
+        # Проверяем, инициализирован ли Genius API
+        if genius_api is None:
+            await update.message.reply_text("Сервис поиска временно недоступен. Попробуйте позже.")
+            context.user_data.pop('state', None)
+            return
+        
+        # Выполняем поиск через Genius API
+        try:
+            search_results = genius_api.search_songs(lyrics_snippet, per_page=5)
+            
+            if search_results and 'hits' in search_results and search_results['hits']:
+                # Формируем список найденных песен
+                response_text = "Найденные песни:\n\n"
+                
+                for i, hit in enumerate(search_results['hits'][:5], 1):  # Показываем первые 5 результатов
+                    result = hit['result']
+                    title = result.get('title', 'Неизвестно')
+                    artist = result.get('primary_artist', {}).get('name', 'Неизвестный исполнитель')
+                    url = result.get('url', '#')
+                    
+                    response_text += f"{i}. **{title}** - {artist}\n"
+                    response_text += f"   [Ссылка]({url})\n\n"
+                
+                # Добавляем инструкцию
+                response_text += "Если нужной песни нет в списке, попробуйте отправить другой отрывок."
+                
+                await update.message.reply_text(response_text, parse_mode='Markdown')
+                
+            else:
+                await update.message.reply_text(
+                    "Не удалось найти песню по этому отрывку.\n"
+                    "Попробуйте:\n"
+                    "• Отправить другой отрывок\n"
+                    "• Проверить правильность написания\n"
+                    "• Использовать более уникальные слова из песни"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка при поиске в Genius API: {e}")
+            await update.message.reply_text(
+                "Произошла ошибка при поиске. Пожалуйста, попробуйте позже."
+            )
+        
+        # Сбрасываем состояние
+        context.user_data.pop('state', None)
+        
+    else:
+        # Если сообщение не соответствует ни одному состоянию
+        await update.message.reply_text(
+            "Выберите действие с помощью кнопок ниже:",
+            reply_markup=ReplyKeyboardMarkup(
+                [["Найти музыку по тексту"], ["Скачать музыку"]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+        )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена текущего действия"""
+    context.user_data.pop('state', None)
+    await update.message.reply_text(
+        "Действие отменено. Выберите новое действие:",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Найти музыку по тексту"], ["Скачать музыку"]],
+            resize_keyboard=True
+        )
+    )
+    
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помощь"""
+    help_text = (
+        "*Бот для поиска музыки*\n\n"
+        "Доступные команды:\n"
+        "• /start - Начало работы\n"
+        "• /cancel - Отменить текущее действие\n"
+        "• /help - Эта справка\n\n"
+        "Как использовать:\n"
+        "1. Нажмите 'Найти музыку по тексту'\n"
+        "2. Отправьте отрывок из песни\n"
+        "3. Получите список найденных песен\n\n"
+        "Советы:\n"
+        "• Используйте уникальные фразы из песни\n"
+        "• Минимум 5 символов\n"
+        "• Лучше несколько строк"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline-кнопок (если они понадобятся в будущем)"""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(text="Эта функция пока не реализована")
+
+def main():
+    """Основная функция запуска бота"""
+    try:
+        # Проверка токенов
+        if TOKEN == 'ВАШ_ТОКЕН_ТЕЛЕГРАМ' or GENIUS_TOKEN == 'ВАШ_ТОКЕН_GENIUS':
+            logger.warning("Используются тестовые токены! Замените их на настоящие.")
+        
+        # Создание приложения
+        application = Application.builder().token(TOKEN).build()
+        
+        # Добавление обработчиков
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("cancel", cancel))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+        application.add_handler(CallbackQueryHandler(handle_inline_buttons))
+        
+        # Запуск бота
+        logger.info("Бот запускается...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
+
+if __name__ == '__main__':
+    main()
