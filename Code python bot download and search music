@@ -1,0 +1,700 @@
+import logging
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
+)
+import lyricsgenius as genius
+import os
+import yt_dlp
+import asyncio
+from pathlib import Path
+import subprocess
+import json
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Токены
+TOKEN = os.getenv('', '')
+GENIUS_TOKEN = os.getenv('', '')
+
+# Инициализация Genius API
+try:
+    genius_api = genius.Genius(GENIUS_TOKEN)
+    genius_api.verbose = False
+except Exception as e:
+    logger.error(f"Ошибка инициализации Genius API: {e}")
+    genius_api = None
+
+# Состояния для ConversationHandler
+WAITING_FOR_LYRICS = 1
+WAITING_FOR_SEARCH_QUERY = 2
+WAITING_FOR_DOWNLOAD_CHOICE = 3
+
+# Директория для загрузок
+DOWNLOAD_DIR = "downloads"
+Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    keyboard = [
+        ["🔍 Найти музыку по тексту"],
+        ["🎵 Скачать музыку по названию"],
+        ["📁 Мои загрузки"],
+        ["❓ Помощь"]
+    ]
+    
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        "🎵 *Добро пожаловать в MusicBot!*\n\n"
+        "Я помогу вам найти текст песни по отрывку и скачать музыку.\n\n"
+        "Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    
+    context.user_data.clear()
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки клавиатуры"""
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    if text == "🔍 Найти музыку по тексту":
+        await update.message.reply_text(
+            "📝 Пожалуйста, отправьте отрывок текста песни (несколько строк), и я попробую найти её."
+        )
+        context.user_data['state'] = WAITING_FOR_LYRICS
+        
+    elif text == "🎵 Скачать музыку по названию":
+        await update.message.reply_text(
+            "🔎 Введите название песни и исполнителя для поиска.\n"
+            "Например: *Imagine Dragons - Believer* или *Billie Eilish*",
+            parse_mode='Markdown'
+        )
+        context.user_data['state'] = WAITING_FOR_SEARCH_QUERY
+        
+    elif text == "📁 Мои загрузки":
+        await show_downloads(update, context)
+        
+    elif text == "❓ Помощь":
+        await help_command(update, context)
+        
+    elif context.user_data.get('state') == WAITING_FOR_LYRICS:
+        await search_by_lyrics(update, context, text)
+        
+    elif context.user_data.get('state') == WAITING_FOR_SEARCH_QUERY:
+        await search_music(update, context, text)
+        
+    elif context.user_data.get('state') == WAITING_FOR_DOWNLOAD_CHOICE:
+        await handle_download_choice(update, context, text)
+        
+    else:
+        await update.message.reply_text(
+            "Выберите действие с помощью кнопок ниже:",
+            reply_markup=ReplyKeyboardMarkup(
+                [["🔍 Найти музыку по тексту"], ["🎵 Скачать музыку по названию"], ["📁 Мои загрузки"], ["❓ Помощь"]],
+                resize_keyboard=True
+            )
+        )
+
+async def search_by_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE, lyrics_snippet: str):
+    """Поиск песни по тексту через Genius"""
+    lyrics_snippet = lyrics_snippet.strip()
+    
+    if len(lyrics_snippet) < 5:
+        await update.message.reply_text("❌ Пожалуйста, отправьте более длинный отрывок (минимум 5 символов).")
+        return
+        
+    await update.message.reply_text(f"🔍 Ищу песню по тексту: '{lyrics_snippet[:50]}...'")
+    
+    if genius_api is None:
+        await update.message.reply_text("❌ Сервис поиска временно недоступен. Попробуйте позже.")
+        context.user_data.pop('state', None)
+        return
+    
+    try:
+        search_results = genius_api.search_songs(lyrics_snippet, per_page=5)
+        
+        if search_results and 'hits' in search_results and search_results['hits']:
+            response_text = "🎵 *Найденные песни:*\n\n"
+            context.user_data['search_results'] = []
+            
+            for i, hit in enumerate(search_results['hits'][:5], 1):
+                result = hit['result']
+                title = result.get('title', 'Неизвестно')
+                artist = result.get('primary_artist', {}).get('name', 'Неизвестный исполнитель')
+                url = result.get('url', '#')
+                
+                response_text += f"*{i}. {title}* — {artist}\n"
+                response_text += f"   [Текст песни]({url})\n\n"
+                
+                context.user_data['search_results'].append({
+                    'title': title,
+                    'artist': artist,
+                    'url': url
+                })
+            
+            response_text += "Хотите скачать одну из этих песен? Используйте кнопку *🎵 Скачать музыку по названию*"
+            
+            await update.message.reply_text(response_text, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(
+                "😔 Не удалось найти песню по этому отрывку.\n"
+                "Попробуйте:\n"
+                "• Отправить другой отрывок\n"
+                "• Проверить правильность написания\n"
+                "• Использовать более уникальные слова из песни"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при поиске в Genius API: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при поиске. Пожалуйста, попробуйте позже.")
+    
+    context.user_data.pop('state', None)
+
+async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+    """Поиск музыки через YouTube с улучшенными таймаутами"""
+    if not query or len(query.strip()) < 2:
+        await update.message.reply_text("❌ Слишком короткий запрос. Введите хотя бы 2 символа.")
+        context.user_data.pop('state', None)
+        return
+    
+    search_msg = await update.message.reply_text(
+        f"🔍 Ищу: *{query}*\n⏳ Пробую быстрый поиск...", 
+        parse_mode='Markdown'
+    )
+    
+    # Пробуем разные методы поиска
+    search_methods = [
+        # Метод 1: Самый быстрый, только названия
+        {
+            'name': 'быстрый',
+            'opts': {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': 'in_playlist',
+                'ignoreerrors': True,
+                'socket_timeout': 5,
+                'retries': 1,
+                'fragment_retries': 0,
+                'skip_download': True,
+                'extractor_args': {'youtube': {'skip': ['webpage', 'js', 'http']}}
+            },
+            'query_format': "ytsearch5:{0}"
+        },
+        # Метод 2: Стандартный поиск
+        {
+            'name': 'стандартный',
+            'opts': {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': True,
+                'ignoreerrors': True,
+                'socket_timeout': 8,
+            },
+            'query_format': "ytsearch5:{0}"
+        }
+    ]
+    
+    info = None
+    last_error = None
+    
+    for method in search_methods:
+        try:
+            await search_msg.edit_text(f"🔍 Ищу: *{query}*\n⏳ Метод: {method['name']}...", parse_mode='Markdown')
+            
+            # Формируем поисковый запрос
+            search_query = method['query_format'].format(query)
+            
+            # Запускаем поиск с очень маленьким таймаутом
+            info = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: yt_dlp.YoutubeDL(method['opts']).extract_info(search_query, download=False)
+                ),
+                timeout=8.0  # Уменьшаем таймаут до 8 секунд
+            )
+            
+            if info and 'entries' in info and info['entries']:
+                # Проверяем, есть ли реальные результаты
+                valid_entries = [e for e in info['entries'] if e and e.get('title') and e.get('id')]
+                if valid_entries:
+                    logger.info(f"Поиск успешен методом: {method['name']}")
+                    break
+                else:
+                    info = None
+                    
+        except asyncio.TimeoutError:
+            last_error = f"Таймаут метода {method['name']}"
+            logger.warning(f"Таймаут поиска методом {method['name']} для запроса: {query}")
+            continue
+        except Exception as e:
+            last_error = f"Ошибка метода {method['name']}: {e}"
+            logger.error(f"Ошибка поиска методом {method['name']}: {e}")
+            continue
+    
+    # Если ничего не нашли, пробуем упрощенный запрос
+    if not info or not info.get('entries'):
+        # Пробуем искать без специальных слов
+        simple_query = query.replace(' - ', ' ').split()[0] if ' ' in query else query
+        
+        if simple_query != query:
+            await search_msg.edit_text(f"🔍 Ищу упрощенный запрос: *{simple_query}*...", parse_mode='Markdown')
+            
+            try:
+                search_query = f"ytsearch3:{simple_query}"
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        lambda: yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}).extract_info(
+                            search_query, download=False
+                        )
+                    ),
+                    timeout=6.0
+                )
+            except:
+                pass
+    
+    # Если все еще нет результатов
+    if not info or 'entries' not in info or not info['entries']:
+        error_text = (
+            "❌ *Не удалось найти треки*\n\n"
+            "💡 *Возможные причины:*\n"
+            "• YouTube временно недоступен\n"
+            "• Слишком специфичный запрос\n"
+            "• Проблемы с сетью\n\n"
+            "*Попробуйте:*\n"
+            "• Более короткий запрос\n"
+            "• Написать на английском\n"
+            "• Только название песни\n"
+            "• Повторить через минуту"
+        )
+        await search_msg.edit_text(error_text, parse_mode='Markdown')
+        context.user_data.pop('state', None)
+        return
+    
+    # Фильтруем результаты
+    valid_entries = []
+    for entry in info['entries'][:5]:  # Берем только первые 5
+        if entry and entry.get('title') and entry.get('id'):
+            valid_entries.append(entry)
+            if len(valid_entries) >= 5:
+                break
+    
+    if not valid_entries:
+        await search_msg.edit_text("❌ Найдены некорректные результаты. Попробуйте другой запрос.")
+        context.user_data.pop('state', None)
+        return
+    
+    # Сохраняем результаты
+    context.user_data['search_results_youtube'] = []
+    response_lines = ["🎵 *Найденные треки:*\n"]
+    
+    for i, entry in enumerate(valid_entries, 1):
+        try:
+            title = entry.get('title', 'Неизвестно')
+            
+            # Очищаем название
+            clean_title = title
+            remove_list = [
+                '(Official Video)', '(Official Audio)', '(Lyrics)', 
+                '(Music Video)', '4K', 'HD', '(1080p)', '(720p)',
+                'Official', 'Video', 'Audio', 'Lyric', 'Music',
+                '|', '[]', '()', '{}'
+            ]
+            for x in remove_list:
+                clean_title = clean_title.replace(x, '')
+            
+            clean_title = ' '.join(clean_title.split())
+            
+            # Определяем исполнителя
+            artist = "Неизвестно"
+            if ' - ' in clean_title:
+                parts = clean_title.split(' - ', 1)
+                artist = parts[0].strip()
+                clean_title = parts[1].strip()
+            elif ' by ' in clean_title.lower():
+                parts = clean_title.lower().split(' by ', 1)
+                artist = parts[1].strip().title()
+                clean_title = parts[0].strip().title()
+            
+            video_id = entry.get('id', '')
+            url = f"https://youtube.com/watch?v={video_id}"
+            
+            response_lines.append(f"*{i}. {clean_title}*")
+            response_lines.append(f"   👤 {artist}")
+            response_lines.append(f"   [🔗 Ссылка]({url})\n")
+            
+            context.user_data['search_results_youtube'].append({
+                'title': clean_title or title[:50],
+                'artist': artist,
+                'url': url,
+                'id': video_id
+            })
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки: {e}")
+            continue
+    
+    if not context.user_data['search_results_youtube']:
+        await search_msg.edit_text("❌ Не удалось обработать результаты.")
+        context.user_data.pop('state', None)
+        return
+    
+    response_lines.append(f"📥 *Введите номер трека (1-{len(context.user_data['search_results_youtube'])}):*")
+    response_lines.append("❌ /cancel - отменить")
+    
+    await search_msg.edit_text(
+        "\n".join(response_lines),
+        parse_mode='Markdown',
+        disable_web_page_preview=True
+    )
+    
+    context.user_data['state'] = WAITING_FOR_DOWNLOAD_CHOICE
+
+async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, choice: str):
+    """Обработка выбора трека для скачивания"""
+    try:
+        choice_num = int(choice.strip())
+        search_results = context.user_data.get('search_results_youtube', [])
+        
+        if 1 <= choice_num <= len(search_results):
+            selected = search_results[choice_num - 1]
+            await update.message.reply_text(f"⏳ Начинаю загрузку: *{selected['title']}*", parse_mode='Markdown')
+            
+            # Запускаем загрузку и конвертацию
+            await download_and_convert(update, context, selected)
+        else:
+            await update.message.reply_text("❌ Неверный номер. Попробуйте снова.")
+    except ValueError:
+        await update.message.reply_text("❌ Пожалуйста, введите номер от 1 до 5.")
+    except Exception as e:
+        logger.error(f"Ошибка при выборе трека: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте снова.")
+        context.user_data.pop('state', None)
+
+async def download_and_convert(update: Update, context: ContextTypes.DEFAULT_TYPE, track_info: dict):
+    """Упрощенная загрузка и отправка музыки"""
+    title = track_info.get('title', 'Неизвестный трек')
+    artist = track_info.get('artist', 'Неизвестный исполнитель')
+    url = track_info.get('url', '')
+    
+    if not url:
+        await update.message.reply_text("❌ Неверная ссылка на трек")
+        context.user_data.pop('state', None)
+        return
+    
+    # Отправляем сообщение о начале загрузки
+    status_msg = await update.message.reply_text(
+        f"⏳ Загружаю: *{title}*",
+        parse_mode='Markdown'
+    )
+    
+    # Создаем уникальное имя файла
+    import time
+    timestamp = int(time.time())
+    safe_title = "".join(c for c in title if c.isalnum() or c in ' _-')[:30]
+    filename = f"{safe_title}_{timestamp}.mp3"
+    filepath = os.path.join(DOWNLOAD_DIR, filename)
+    
+    try:
+        # МАКСИМАЛЬНО ПРОСТЫЕ настройки
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': filepath.replace('.mp3', ''),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '128',
+            }],
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+        }
+        
+        await status_msg.edit_text(f"⏳ Загрузка...")
+        
+        # Загружаем
+        def download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            return True
+        
+        await asyncio.wait_for(
+            asyncio.to_thread(download),
+            timeout=180.0
+        )
+        
+        await status_msg.edit_text("✅ Загрузка завершена!\n🔍 Ищу файл...")
+        await asyncio.sleep(1)
+        
+        # Ищем файл
+        audio_file = None
+        
+        # Проверяем точное совпадение
+        if os.path.exists(filepath):
+            audio_file = filepath
+        elif os.path.exists(filepath.replace('.mp3', '.m4a')):
+            audio_file = filepath.replace('.mp3', '.m4a')
+        elif os.path.exists(filepath.replace('.mp3', '.webm')):
+            audio_file = filepath.replace('.mp3', '.webm')
+        else:
+            # Ищем по времени создания
+            current_time = time.time()
+            for f in os.listdir(DOWNLOAD_DIR):
+                f_path = os.path.join(DOWNLOAD_DIR, f)
+                if os.path.isfile(f_path) and f.endswith(('.mp3', '.m4a', '.webm')):
+                    f_time = os.path.getctime(f_path)
+                    if current_time - f_time < 60:  # Последние 60 секунд
+                        audio_file = f_path
+                        break
+        
+        if audio_file and os.path.exists(audio_file):
+            file_size = os.path.getsize(audio_file) / (1024 * 1024)
+            
+            await status_msg.edit_text(
+                f"✅ Файл готов!\n"
+                f"📊 Размер: {file_size:.1f} MB\n"
+                f"📤 Отправка...",
+                parse_mode='Markdown'
+            )
+            
+            if file_size <= 50:
+                # ОТПРАВЛЯЕМ ФАЙЛ
+                success, method = await send_file_simple(update, audio_file, title, artist)
+                
+                if success:
+                    await status_msg.edit_text(f"✅ Отправлено! ({method})")
+                    
+                    # Сохраняем в историю
+                    if 'downloads' not in context.user_data:
+                        context.user_data['downloads'] = []
+                    context.user_data['downloads'].insert(0, {
+                        'title': title[:50],
+                        'artist': artist[:50],
+                        'date': update.message.date.strftime("%d.%m.%Y %H:%M"),
+                        'size': f"{file_size:.1f} MB"
+                    })
+                    context.user_data['downloads'] = context.user_data['downloads'][:10]
+                else:
+                    await status_msg.edit_text(f"❌ Ошибка отправки: {method}")
+                
+                # Удаляем файл
+                try:
+                    os.remove(audio_file)
+                    logger.info(f"Удален: {os.path.basename(audio_file)}")
+                except:
+                    pass
+            else:
+                await status_msg.edit_text(f"❌ Файл слишком большой: {file_size:.1f} MB")
+                os.remove(audio_file)
+        else:
+            await status_msg.edit_text("❌ Файл не найден")
+            
+            # Показываем что есть в папке
+            files = os.listdir(DOWNLOAD_DIR)[-5:]
+            if files:
+                text = "📁 Файлы:\n"
+                for f in files:
+                    text += f"• {f[:30]}\n"
+                await update.message.reply_text(text)
+            
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("❌ Превышено время загрузки")
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+    finally:
+        context.user_data.pop('state', None)
+
+async def send_file_simple(update: Update, file_path: str, title: str, artist: str):
+    """Максимально простая отправка файла в Telegram"""
+    try:
+        # 1. Пробуем отправить как аудио
+        with open(file_path, 'rb') as f:
+            await update.message.reply_audio(
+                audio=f,
+                title=title[:50],
+                performer=artist[:50]
+            )
+        return True, "audio"
+    except Exception as e1:
+        logger.error(f"Ошибка отправки аудио: {e1}")
+        
+        try:
+            # 2. Пробуем отправить как документ
+            with open(file_path, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(file_path),
+                    caption=f"🎵 {title[:30]}"
+                )
+            return True, "document"
+        except Exception as e2:
+            logger.error(f"Ошибка отправки документа: {e2}")
+            
+            try:
+                # 3. Читаем файл в память и отправляем
+                with open(file_path, 'rb') as f:
+                    file_data = f.read()
+                
+                from telegram import BufferedInputFile
+                file = BufferedInputFile(file_data, filename=os.path.basename(file_path))
+                
+                await update.message.reply_document(
+                    document=file,
+                    caption=f"🎵 {title[:30]}"
+                )
+                return True, "buffered"
+            except Exception as e3:
+                logger.error(f"Ошибка BufferedInputFile: {e3}")
+                
+                return False, str(e1)[:100]
+
+async def update_progress(progress_queue: asyncio.Queue, context: ContextTypes.DEFAULT_TYPE, progress_msg):
+    """Асинхронная функция обновления прогресса"""
+    last_percent = 0
+    
+    try:
+        while True:
+            try:
+                # Получаем данные из очереди с таймаутом
+                data = await asyncio.wait_for(progress_queue.get(), timeout=1.0)
+                
+                if data.get('status') == 'finished':
+                    await progress_msg.edit_text("⏳ Конвертация в MP3...")
+                    break
+                
+                downloaded = data.get('downloaded', 0)
+                total = data.get('total', 0)
+                percent = data.get('percent', 0)
+                speed = data.get('speed', 0)
+                
+                # Обновляем только если прогресс изменился минимум на 2%
+                if total > 0 and percent - last_percent >= 2:
+                    # Форматируем скорость
+                    if speed:
+                        if speed > 1024 * 1024:
+                            speed_str = f"{speed / (1024 * 1024):.1f} MB/s"
+                        else:
+                            speed_str = f"{speed / 1024:.1f} KB/s"
+                    else:
+                        speed_str = "?"
+                    
+                    # Форматируем размер
+                    downloaded_mb = downloaded / (1024 * 1024)
+                    total_mb = total / (1024 * 1024)
+                    
+                    progress_text = f"⏳ Загрузка: {percent:.0f}% ({downloaded_mb:.1f}/{total_mb:.1f} MB, {speed_str})"
+                    
+                    try:
+                        await progress_msg.edit_text(progress_text)
+                        last_percent = percent
+                    except Exception as e:
+                        logger.error(f"Ошибка обновления сообщения: {e}")
+                        
+            except asyncio.TimeoutError:
+                # Таймаут получения данных - продолжаем ждать
+                continue
+            except Exception as e:
+                logger.error(f"Ошибка в update_progress: {e}")
+                break
+                
+    except asyncio.CancelledError:
+        # Задача отменена
+        logger.info("Обновление прогресса отменено")
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка в update_progress: {e}")
+
+async def show_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать историю загрузок"""
+    downloads = context.user_data.get('downloads', [])
+    
+    if downloads:
+        text = "📁 *Ваши последние загрузки:*\n\n"
+        for i, download in enumerate(downloads[-5:], 1):
+            text += f"{i}. {download['title']}\n"
+        text += "\nЗагруженные файлы сохранены на сервере."
+    else:
+        text = "📁 У вас пока нет загруженных файлов."
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена текущего действия"""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "❌ Действие отменено.",
+        reply_markup=ReplyKeyboardMarkup(
+            [["🔍 Найти музыку по тексту"], ["🎵 Скачать музыку по названию"], ["📁 Мои загрузки"], ["❓ Помощь"]],
+            resize_keyboard=True
+        )
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помощь"""
+    help_text = (
+        "🎵 *MusicBot — Помощь*\n\n"
+        "*Доступные функции:*\n"
+        "• 🔍 *Поиск по тексту* — находит песню по отрывку\n"
+        "• 🎵 *Скачать музыку* — поиск и загрузка MP3\n"
+        "• 📁 *Мои загрузки* — история загрузок\n\n"
+        "*Как скачать музыку:*\n"
+        "1. Нажмите 'Скачать музыку по названию'\n"
+        "2. Введите название трека и исполнителя\n"
+        "3. Выберите номер трека из списка\n"
+        "4. Дождитесь загрузки и конвертации\n\n"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline-кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if data.startswith('download_'):
+        track_id = data.replace('download_', '')
+        # Здесь можно добавить обработку inline скачивания
+
+def main():
+    """Основная функция запуска бота"""
+    try:
+        # Проверка наличия ffmpeg
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            logger.info("✅ ffmpeg найден")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.error("❌ ffmpeg не установлен! Установите ffmpeg для работы функции скачивания.")
+            logger.error("Ubuntu/Debian: sudo apt install ffmpeg")
+            logger.error("MacOS: brew install ffmpeg")
+            logger.error("Windows: скачайте с ffmpeg.org")
+        
+        # Создание приложения
+        application = Application.builder().token(TOKEN).build()
+        
+        # Добавление обработчиков
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("cancel", cancel))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+        application.add_handler(CallbackQueryHandler(handle_inline_buttons))
+        
+        # Запуск бота
+        logger.info("🚀 Бот запускается...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при запуске бота: {e}")
+
+if __name__ == '__main__':
+    main()
