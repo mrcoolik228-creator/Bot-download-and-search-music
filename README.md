@@ -1,4 +1,4 @@
-Music Search Bot
+Music Search/Download Bot
 
 Telegram бот для поиска песен по отрывку текста через Genius API.
 
@@ -21,11 +21,6 @@ Telegram бот для поиска песен по отрывку текста 
 Технологии
 
 Python 3.8+, библиотеки python-telegram-bot (работа с Telegram), lyricsgenius (поиск песен), python-dotenv (хранение токенов).
-
-Установка:
-
-Установите зависимости:
-pip install -r requirements.txt
 
 Создайте файл .env и добавьте токены:
 TELEGRAM_BOT_TOKEN=ваш_токен
